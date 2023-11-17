@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,26 @@ type Client struct {
 	HttpClient      *http.Client
 	AzureBlobClient *azblob.Client
 	IsMock          bool
+}
+
+var BadgerDB *Sett
+
+// struct to cache https response
+type Mycache struct {
+	//string(bodyBytes), res.StatusCode, duration, err
+	Body       []byte
+	StatusCode int
+	Duration   time.Duration
+	Err        error
+	JsonBody   bool
+}
+
+func BadgerInit() {
+	if BadgerDB == nil {
+		gob.Register(&Mycache{})
+		gob.Register(&json.RawMessage{})
+		BadgerDB = Open()
+	}
 }
 
 func GetTLSConfigFromSettings(settings models.InfinitySettings) (*tls.Config, error) {
@@ -150,10 +171,74 @@ func replaceSect(input string, settings models.InfinitySettings, includeSect boo
 	return input
 }
 
+func getBadgerKey(headers []models.URLOptionKeyValuePair) (string, time.Duration, error) {
+	badgerkey := ""
+	badgerttl := time.Duration(60) * time.Second
+	err := fmt.Errorf("error getting cache headers options")
+	for _, header := range headers {
+		if header.Key == "cacheq" {
+			badgerkey = header.Value
+			err = nil
+		}
+		if header.Key == "cachettl" {
+			if ttl, err := time.ParseDuration(header.Value); err == nil {
+				badgerttl = ttl
+			}
+		}
+	}
+	backend.Logger.Info("@@@getbadgerkey", "key", badgerkey, "ttl", badgerttl, "err", err)
+	return badgerkey, badgerttl, err
+}
+
+func setCache(headers []models.URLOptionKeyValuePair, mycache Mycache) error {
+	if badgerkey, badgerttl, err := getBadgerKey(headers); err == nil {
+		if err := BadgerDB.Table("peers").WithTTL(badgerttl).SetStruct(badgerkey, &mycache); err != nil {
+			return fmt.Errorf("@@@@@@@set data to cache error in badger  %v", err)
+		} else {
+			backend.Logger.Info("@@@@@@SetCache  to set data to cache key info,", "key", badgerkey, "ttl", badgerttl, "err", err)
+			return nil
+		}
+	} else {
+		backend.Logger.Info("@@@@@@@SetCache  no caching because of nooption")
+	}
+	return nil
+}
+
+func getCache(headers []models.URLOptionKeyValuePair) (*Mycache, error) {
+	if badgerkey, _, err := getBadgerKey(headers); err == nil {
+		if res, err := BadgerDB.Table("peers").GetStruct(badgerkey); err != nil {
+			return nil, err
+		} else {
+			return res.(*Mycache), nil
+		}
+	} else {
+		return nil, fmt.Errorf("error getting data frame from cache %v", err)
+	}
+}
+
 func (client *Client) req(ctx context.Context, url string, body io.Reader, settings models.InfinitySettings, query models.Query, requestHeaders map[string]string) (obj any, statusCode int, duration time.Duration, err error) {
+	BadgerInit()
 	ctx, span := tracing.DefaultTracer().Start(ctx, "client.req")
 	defer span.End()
 	req, _ := GetRequest(ctx, settings, body, query, requestHeaders, true)
+	//backend.Logger.Info("=====================>requesting URL", "url", url, "method", req.Method, "headers", query.URLOptions.Headers)
+	if cache, err := getCache(query.URLOptions.Headers); err == nil {
+
+		if cache.JsonBody {
+			var out any
+			err := json.Unmarshal(cache.Body, &out)
+			if err != nil {
+				backend.Logger.Error("error un-marshaling JSON response", "url", url, "error", err.Error())
+			}
+			backend.Logger.Info("=====================>requesting URL Cache found for", "url", url, "method", req.Method, "headers", query.URLOptions.Headers)
+			return out, cache.StatusCode, cache.Duration, err
+		}
+		backend.Logger.Info("=====================>requesting URL Cache ** NOT ** found for", "url", url, "method", req.Method, "headers", query.URLOptions.Headers)
+
+		return string(cache.Body), cache.StatusCode, cache.Duration, cache.Err
+	}
+	backend.Logger.Info("=====================>requesting URL Cache ** NOT ** found for", "url", url, "method", req.Method, "headers", query.URLOptions.Headers)
+
 	startTime := time.Now()
 	if !CanAllowURL(req.URL.String(), settings.AllowedHosts) {
 		backend.Logger.Error("url is not in the allowed list. make sure to match the base URL with the settings", "url", req.URL.String())
@@ -192,8 +277,14 @@ func (client *Client) req(ctx context.Context, url string, body io.Reader, setti
 		if err != nil {
 			backend.Logger.Error("error un-marshaling JSON response", "url", url, "error", err.Error())
 		}
+		mycache := Mycache{bodyBytes, res.StatusCode, duration, err, true}
+		errset := setCache(query.URLOptions.Headers, mycache)
+		backend.Logger.Info("SetCache  to set data to cache json", errset)
 		return out, res.StatusCode, duration, err
 	}
+	mycache := Mycache{bodyBytes, res.StatusCode, duration, err, false}
+	errset := setCache(query.URLOptions.Headers, mycache)
+	backend.Logger.Info("SetCache  to set data to cache string", errset)
 	return string(bodyBytes), res.StatusCode, duration, err
 }
 
