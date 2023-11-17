@@ -209,6 +209,7 @@ func getCache(headers []models.URLOptionKeyValuePair) (*Mycache, error) {
 		if res, err := BadgerDB.Table("peers").GetStruct(badgerkey); err != nil {
 			return nil, err
 		} else {
+			res.(*Mycache).Duration = 0 // surdefine new time
 			return res.(*Mycache), nil
 		}
 	} else {
